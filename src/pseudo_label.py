@@ -4,15 +4,16 @@ Usage:
     uv run python src/pseudo_label.py <path-to-transcript.md>
     uv run python src/pseudo_label.py <path-to-session.json>
 
-The script will interactively ask for provider, model, API key, and base URL.
+The script will interactively ask for provider, API key, base URL, then query the
+API's /models endpoint so you can pick a model by number.
 """
 from __future__ import annotations
 
 import argparse
 import getpass
 import json
-import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -22,24 +23,16 @@ LABELED_DIR = PROJECT_ROOT / "data" / "labeled"
 
 PROVIDERS = {
     "openai": {
-        "models": ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
-        "default_base": "https://api.openai.com/v1/chat/completions",
+        "default_base": "https://api.openai.com/v1",
     },
     "deepseek": {
-        "models": ["deepseek-chat", "deepseek-reasoner"],
-        "default_base": "https://api.deepseek.com/v1/chat/completions",
+        "default_base": "https://api.deepseek.com/v1",
     },
     "openrouter": {
-        "models": [
-            "anthropic/claude-3.5-sonnet",
-            "openai/gpt-4o-mini",
-            "deepseek/deepseek-chat",
-        ],
-        "default_base": "https://openrouter.ai/api/v1/chat/completions",
+        "default_base": "https://openrouter.ai/api/v1",
     },
     "custom": {
-        "models": [],
-        "default_base": "http://localhost:8000/v1/chat/completions",
+        "default_base": "http://localhost:8000/v1",
     },
 }
 
@@ -67,12 +60,20 @@ Transcript:
 """
 
 
-def select_provider() -> tuple[str, str, str]:
-    """Interactively choose provider, model, and base URL."""
+def normalize_base_url(url: str) -> str:
+    """Treat the URL as the API base, stripping a trailing /chat/completions if present."""
+    url = url.rstrip("/")
+    if url.endswith("/chat/completions"):
+        url = url[: -len("/chat/completions")]
+    return url.rstrip("/")
+
+
+def select_provider() -> tuple[str, str]:
+    """Interactively choose provider and base URL."""
     print("\nAvailable providers:")
     for i, name in enumerate(PROVIDERS, 1):
         print(f"  {i}. {name}")
-    print(f"  0. custom (enter model and base URL manually)")
+    print("  0. custom (enter base URL manually)")
 
     choice = input("\nSelect provider [1]: ").strip() or "1"
     try:
@@ -85,46 +86,68 @@ def select_provider() -> tuple[str, str, str]:
     else:
         provider = list(PROVIDERS.keys())[idx - 1]
 
-    provider_cfg = PROVIDERS[provider]
-
-    if provider_cfg["models"]:
-        print(f"\nAvailable models for {provider}:")
-        for i, model in enumerate(provider_cfg["models"], 1):
-            print(f"  {i}. {model}")
-        model_choice = input(f"Select model [1]: ").strip() or "1"
-        try:
-            model = provider_cfg["models"][int(model_choice) - 1]
-        except (ValueError, IndexError):
-            model = provider_cfg["models"][0]
-    else:
-        model = input("Model name: ").strip()
-
-    default_base = provider_cfg["default_base"]
+    default_base = PROVIDERS[provider]["default_base"]
     base_url = input(f"Base URL [{default_base}]: ").strip() or default_base
-
-    return provider, model, base_url
+    return provider, normalize_base_url(base_url)
 
 
 def get_api_key() -> str:
-    return getpass.getpass("API key: ").strip()
+    return getpass.getpass("API key (leave empty if none): ").strip()
+
+
+def fetch_models(base_url: str, api_key: str) -> list[str]:
+    """Try to GET /models from the API. Return empty list on failure."""
+    models_url = f"{base_url}/models"
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(models_url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return [m["id"] for m in data.get("data", []) if "id" in m]
+    except Exception:
+        return []
+
+
+def select_model(models: list[str]) -> str:
+    if not models:
+        return input("Model name: ").strip()
+
+    print(f"\nAvailable models from API ({len(models)}):")
+    for i, model in enumerate(models, 1):
+        print(f"  {i}. {model}")
+    choice = input("Select model [1]: ").strip() or "1"
+    try:
+        return models[int(choice) - 1]
+    except (ValueError, IndexError):
+        return models[0]
+
+
+def _decode_error(e: urllib.error.HTTPError) -> str:
+    try:
+        body = e.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+    return f"HTTP {e.code}: {e.reason}\n{body}".strip()
 
 
 def call_llm(transcript: str, model: str, api_key: str, base_url: str) -> list[dict[str, Any]]:
+    chat_url = f"{base_url}/chat/completions"
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": PROMPT_TEMPLATE.format(transcript=transcript)}],
         "temperature": 0.3,
-        "max_tokens": 4000,
     }
 
     data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(
-        base_url,
+        chat_url,
         data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
+        headers=headers,
         method="POST",
     )
 
@@ -132,7 +155,7 @@ def call_llm(transcript: str, model: str, api_key: str, base_url: str) -> list[d
         with urllib.request.urlopen(req, timeout=120) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"LLM request failed: {e.read().decode()}") from e
+        raise RuntimeError(f"LLM request failed: {_decode_error(e)}") from e
 
     try:
         content = body["choices"][0]["message"]["content"]
@@ -177,8 +200,15 @@ def main() -> None:
         print(f"File not found: {path}", file=sys.stderr)
         sys.exit(1)
 
-    provider, model, base_url = select_provider()
+    provider, base_url = select_provider()
     api_key = get_api_key()
+
+    models = fetch_models(base_url, api_key)
+    if models:
+        print(f"\nFetched {len(models)} models from {base_url}/models")
+    else:
+        print(f"\nCould not fetch models from {base_url}/models; you can enter one manually.")
+    model = select_model(models)
 
     transcript = load_transcript(path)
     if len(transcript) > 12000:
