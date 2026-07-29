@@ -105,8 +105,11 @@ def ask_api_key() -> str:
     return getpass.getpass("API key (leave empty if none): ").strip()
 
 
+BAD_MODEL_HINTS = ("tts", "image", "embed", "rerank", "whisper", "audio")
+
+
 def fetch_models(base_url: str, api_key: str) -> list[str]:
-    """Try to GET /models from the API. Return empty list on failure."""
+    """Try to GET /models from the API. Return text-ish model IDs."""
     models_url = f"{base_url}/models"
     headers = {"Accept": "application/json"}
     if api_key:
@@ -115,9 +118,22 @@ def fetch_models(base_url: str, api_key: str) -> list[str]:
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return [m["id"] for m in data.get("data", []) if "id" in m]
     except Exception:
         return []
+
+    models: list[str] = []
+    for item in data.get("data", []):
+        model_id = item.get("id")
+        if not model_id:
+            continue
+        lowered = model_id.lower()
+        if any(hint in lowered for hint in BAD_MODEL_HINTS):
+            continue
+        capabilities = item.get("capabilities") or {}
+        if capabilities.get("imageOutput") or capabilities.get("audioOutput"):
+            continue
+        models.append(model_id)
+    return models
 
 
 def select_model(models: list[str]) -> str:
@@ -132,6 +148,12 @@ def select_model(models: list[str]) -> str:
         return models[int(choice) - 1]
     except (ValueError, IndexError):
         return models[0]
+
+
+def model_order(preferred: str, available: list[str]) -> list[str]:
+    ordered = [preferred] if preferred else []
+    ordered.extend(model for model in available if model not in ordered)
+    return ordered
 
 
 def _temperature(value: str | None) -> int | float:
@@ -287,7 +309,7 @@ def find_files(path: Path, recursive: bool = False) -> list[Path]:
 def process_file(
     path: Path,
     provider: str,
-    model: str,
+    models: list[str],
     api_key: str,
     base_url: str,
     temperature: int | float,
@@ -295,29 +317,41 @@ def process_file(
     max_tokens: int,
     timeout: int,
     overwrite: bool,
-) -> int:
+) -> tuple[int, str]:
     output = LABELED_DIR / f"{path.stem}.pseudo_labeled.jsonl"
     if output.exists() and not overwrite:
         print(f"  skip {path.name}: {output.name} already exists")
-        return 0
+        return 0, ""
 
     transcript = focus_transcript(load_transcript(path))
     if len(transcript) > max_chars:
         print(f"  note {path.name}: long, sending first ~{max_chars} characters")
         transcript = transcript[:max_chars]
 
-    labels = call_llm(transcript, model, api_key, base_url, temperature, max_tokens, timeout)
+    last_error: Exception | None = None
+    labels: list[dict[str, Any]] | None = None
+    used_model = ""
+    for model in models:
+        try:
+            labels = call_llm(transcript, model, api_key, base_url, temperature, max_tokens, timeout)
+            used_model = model
+            break
+        except Exception as e:
+            last_error = e
+            print(f"    model failed {model}: {e}")
+    if labels is None:
+        raise RuntimeError(last_error or "all models failed")
 
     LABELED_DIR.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as f:
         for record in labels:
             record["source"] = str(path)
             record["provider"] = provider
-            record["model"] = model
+            record["model"] = used_model
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    print(f"  done {path.name}: {len(labels)} turns -> {output.name}")
-    return len(labels)
+    print(f"  done {path.name}: {len(labels)} turns with {used_model} -> {output.name}")
+    return len(labels), used_model
 
 
 def main() -> None:
@@ -356,12 +390,17 @@ def main() -> None:
         files = [target]
 
     provider, base_url, api_key, model, temperature, max_chars, max_tokens, timeout = resolve_config(args)
+    available_models = fetch_models(base_url, api_key)
+    models = model_order(model, available_models)
 
-    print(f"\nLabeling {len(files)} file(s) with {provider}/{model} (temperature={temperature}, max_chars={max_chars}, max_tokens={max_tokens}, timeout={timeout}) ...")
+    print(f"\nLabeling {len(files)} file(s) with {len(models)} model fallback(s), starting at {models[0]} (temperature={temperature}, max_chars={max_chars}, max_tokens={max_tokens}, timeout={timeout}) ...")
     total = 0
     for path in files:
         try:
-            total += process_file(path, provider, model, api_key, base_url, temperature, max_chars, max_tokens, timeout, args.overwrite)
+            turns, used_model = process_file(path, provider, models, api_key, base_url, temperature, max_chars, max_tokens, timeout, args.overwrite)
+            total += turns
+            if used_model:
+                models = [used_model] + [candidate for candidate in models if candidate != used_model]
         except Exception as e:
             print(f"  failed {path.name}: {e}", file=sys.stderr)
 
