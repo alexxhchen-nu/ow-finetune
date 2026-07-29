@@ -1,24 +1,27 @@
 """Pseudo-label interview transcripts or session logs using an LLM.
 
+Configuration priority (highest first):
+    1. CLI arguments: --provider, --base-url, --api-key, --model
+    2. Environment variables: LLM_PROVIDER, LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+    3. Interactive prompts
+
 Usage:
-    # single file
-    uv run python src/pseudo_label.py <path-to-transcript.md>
+    # single file (env-based, no prompts)
+    LLM_PROVIDER=custom LLM_BASE_URL=http://localhost:20128/v1 \
+    LLM_MODEL=claude-kimi uv run python src/pseudo_label.py transcript.md
 
-    # batch directory (top-level files only)
-    uv run python src/pseudo_label.py <directory>
+    # batch directory
+    uv run python src/pseudo_label.py data/raw_uploads
 
-    # batch directory recursively and overwrite existing outputs
-    uv run python src/pseudo_label.py -r -o <directory>
-
-The script will interactively ask for provider, API key, base URL, then query the
-API's /models endpoint so you can pick a model by number. The same settings are
-used for all files in a batch.
+    # batch directory recursively + overwrite
+    uv run python src/pseudo_label.py -r -o data/raw_uploads
 """
 from __future__ import annotations
 
 import argparse
 import getpass
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -76,8 +79,7 @@ def normalize_base_url(url: str) -> str:
     return url.rstrip("/")
 
 
-def select_provider() -> tuple[str, str]:
-    """Interactively choose provider and base URL."""
+def select_provider() -> str:
     print("\nAvailable providers:")
     for i, name in enumerate(PROVIDERS, 1):
         print(f"  {i}. {name}")
@@ -90,16 +92,16 @@ def select_provider() -> tuple[str, str]:
         idx = 1
 
     if idx == 0:
-        provider = "custom"
-    else:
-        provider = list(PROVIDERS.keys())[idx - 1]
-
-    default_base = PROVIDERS[provider]["default_base"]
-    base_url = input(f"Base URL [{default_base}]: ").strip() or default_base
-    return provider, normalize_base_url(base_url)
+        return "custom"
+    return list(PROVIDERS.keys())[idx - 1]
 
 
-def get_api_key() -> str:
+def ask_base_url(provider: str) -> str:
+    default = PROVIDERS[provider]["default_base"]
+    return input(f"Base URL [{default}]: ").strip() or default
+
+
+def ask_api_key() -> str:
     return getpass.getpass("API key (leave empty if none): ").strip()
 
 
@@ -130,6 +132,37 @@ def select_model(models: list[str]) -> str:
         return models[int(choice) - 1]
     except (ValueError, IndexError):
         return models[0]
+
+
+def resolve_config(args: argparse.Namespace) -> tuple[str, str, str, str]:
+    """Return (provider, base_url, api_key, model) using args -> env -> prompt."""
+    # provider
+    provider = args.provider or os.getenv("LLM_PROVIDER")
+    if not provider:
+        provider = select_provider()
+
+    # base_url
+    base_url = args.base_url or os.getenv("LLM_BASE_URL")
+    if not base_url:
+        base_url = ask_base_url(provider)
+    base_url = normalize_base_url(base_url)
+
+    # api_key
+    api_key = args.api_key or os.getenv("LLM_API_KEY")
+    if api_key is None:
+        api_key = ask_api_key()
+
+    # model
+    model = args.model or os.getenv("LLM_MODEL")
+    if not model:
+        models = fetch_models(base_url, api_key)
+        if models:
+            print(f"\nFetched {len(models)} models from {base_url}/models")
+        else:
+            print(f"\nCould not fetch models from {base_url}/models; enter one manually.")
+        model = select_model(models)
+
+    return provider, base_url, api_key, model
 
 
 def _decode_error(e: urllib.error.HTTPError) -> str:
@@ -236,6 +269,10 @@ def main() -> None:
     parser.add_argument("path", help="Path to a transcript file or a directory of files")
     parser.add_argument("-r", "--recursive", action="store_true", help="Process directories recursively")
     parser.add_argument("-o", "--overwrite", action="store_true", help="Overwrite existing labeled files")
+    parser.add_argument("--provider", help="LLM provider (or env LLM_PROVIDER)")
+    parser.add_argument("--base-url", help="API base URL (or env LLM_BASE_URL)")
+    parser.add_argument("--api-key", help="API key (or env LLM_API_KEY)")
+    parser.add_argument("--model", help="Model name (or env LLM_MODEL)")
     args = parser.parse_args()
 
     target = Path(args.path).expanduser().resolve()
@@ -255,15 +292,7 @@ def main() -> None:
             sys.exit(1)
         files = [target]
 
-    provider, base_url = select_provider()
-    api_key = get_api_key()
-
-    models = fetch_models(base_url, api_key)
-    if models:
-        print(f"\nFetched {len(models)} models from {base_url}/models")
-    else:
-        print(f"\nCould not fetch models from {base_url}/models; you can enter one manually.")
-    model = select_model(models)
+    provider, base_url, api_key, model = resolve_config(args)
 
     print(f"\nLabeling {len(files)} file(s) with {provider}/{model} ...")
     total = 0
