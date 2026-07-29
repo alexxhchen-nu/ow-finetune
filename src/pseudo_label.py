@@ -1,11 +1,18 @@
 """Pseudo-label interview transcripts or session logs using an LLM.
 
 Usage:
+    # single file
     uv run python src/pseudo_label.py <path-to-transcript.md>
-    uv run python src/pseudo_label.py <path-to-session.json>
+
+    # batch directory (top-level files only)
+    uv run python src/pseudo_label.py <directory>
+
+    # batch directory recursively and overwrite existing outputs
+    uv run python src/pseudo_label.py -r -o <directory>
 
 The script will interactively ask for provider, API key, base URL, then query the
-API's /models endpoint so you can pick a model by number.
+API's /models endpoint so you can pick a model by number. The same settings are
+used for all files in a batch.
 """
 from __future__ import annotations
 
@@ -20,6 +27,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LABELED_DIR = PROJECT_ROOT / "data" / "labeled"
+SUPPORTED_EXTS = {".md", ".txt", ".json"}
 
 PROVIDERS = {
     "openai": {
@@ -190,15 +198,62 @@ def load_transcript(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def find_files(path: Path, recursive: bool = False) -> list[Path]:
+    if recursive:
+        files = [p for p in path.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    else:
+        files = [p for p in path.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    return sorted(files)
+
+
+def process_file(path: Path, provider: str, model: str, api_key: str, base_url: str, overwrite: bool) -> int:
+    output = LABELED_DIR / f"{path.stem}.pseudo_labeled.jsonl"
+    if output.exists() and not overwrite:
+        print(f"  skip {path.name}: {output.name} already exists")
+        return 0
+
+    transcript = load_transcript(path)
+    if len(transcript) > 12000:
+        print(f"  note {path.name}: long, sending first ~12000 characters")
+        transcript = transcript[:12000]
+
+    labels = call_llm(transcript, model, api_key, base_url)
+
+    LABELED_DIR.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as f:
+        for record in labels:
+            record["source"] = str(path)
+            record["provider"] = provider
+            record["model"] = model
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    print(f"  done {path.name}: {len(labels)} turns -> {output.name}")
+    return len(labels)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Pseudo-label a transcript with LLM.")
-    parser.add_argument("path", help="Path to transcript .md/.txt/.json")
+    parser = argparse.ArgumentParser(description="Pseudo-label transcripts with an LLM.")
+    parser.add_argument("path", help="Path to a transcript file or a directory of files")
+    parser.add_argument("-r", "--recursive", action="store_true", help="Process directories recursively")
+    parser.add_argument("-o", "--overwrite", action="store_true", help="Overwrite existing labeled files")
     args = parser.parse_args()
 
-    path = Path(args.path).expanduser().resolve()
-    if not path.is_file():
-        print(f"File not found: {path}", file=sys.stderr)
+    target = Path(args.path).expanduser().resolve()
+    if not target.exists():
+        print(f"Path not found: {target}", file=sys.stderr)
         sys.exit(1)
+
+    if target.is_dir():
+        files = find_files(target, recursive=args.recursive)
+        if not files:
+            print(f"No supported files ({', '.join(sorted(SUPPORTED_EXTS))}) found in {target}")
+            sys.exit(0)
+        print(f"\nFound {len(files)} files to label:\n" + "\n".join(f"  - {f.name}" for f in files))
+    else:
+        if target.suffix.lower() not in SUPPORTED_EXTS:
+            print(f"Unsupported file type: {target.suffix}. Supported: {SUPPORTED_EXTS}", file=sys.stderr)
+            sys.exit(1)
+        files = [target]
 
     provider, base_url = select_provider()
     api_key = get_api_key()
@@ -210,24 +265,15 @@ def main() -> None:
         print(f"\nCould not fetch models from {base_url}/models; you can enter one manually.")
     model = select_model(models)
 
-    transcript = load_transcript(path)
-    if len(transcript) > 12000:
-        print("Transcript is long; sending first ~12000 characters to the LLM.")
-        transcript = transcript[:12000]
+    print(f"\nLabeling {len(files)} file(s) with {provider}/{model} ...")
+    total = 0
+    for path in files:
+        try:
+            total += process_file(path, provider, model, api_key, base_url, args.overwrite)
+        except Exception as e:
+            print(f"  failed {path.name}: {e}", file=sys.stderr)
 
-    print(f"\nLabeling with {provider}/{model} ...")
-    labels = call_llm(transcript, model, api_key, base_url)
-
-    LABELED_DIR.mkdir(parents=True, exist_ok=True)
-    output = LABELED_DIR / f"{path.stem}.pseudo_labeled.jsonl"
-    with output.open("w", encoding="utf-8") as f:
-        for record in labels:
-            record["source"] = str(path)
-            record["provider"] = provider
-            record["model"] = model
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    print(f"\nWrote {len(labels)} labeled turns to {output}")
+    print(f"\nTotal labeled turns: {total}")
 
 
 if __name__ == "__main__":
