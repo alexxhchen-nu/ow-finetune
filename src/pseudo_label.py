@@ -2,7 +2,7 @@
 
 Configuration priority (highest first):
     1. CLI arguments: --provider, --base-url, --api-key, --model
-    2. Environment variables: LLM_PROVIDER, LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+    2. Environment variables: LLM_PROVIDER, LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_CHARS, LLM_MAX_TOKENS, LLM_TIMEOUT
     3. Interactive prompts
 
 Usage:
@@ -134,8 +134,19 @@ def select_model(models: list[str]) -> str:
         return models[0]
 
 
-def resolve_config(args: argparse.Namespace) -> tuple[str, str, str, str]:
-    """Return (provider, base_url, api_key, model) using args -> env -> prompt."""
+def _temperature(value: str | None) -> int | float:
+    if not value:
+        return 1
+    parsed = float(value)
+    return int(parsed) if parsed.is_integer() else parsed
+
+
+def _int(value: str | None, default: int) -> int:
+    return int(value) if value else default
+
+
+def resolve_config(args: argparse.Namespace) -> tuple[str, str, str, str, int | float, int, int, int]:
+    """Return LLM config using args -> env -> prompt."""
     # provider
     provider = args.provider or os.getenv("LLM_PROVIDER")
     if not provider:
@@ -162,7 +173,12 @@ def resolve_config(args: argparse.Namespace) -> tuple[str, str, str, str]:
             print(f"\nCould not fetch models from {base_url}/models; enter one manually.")
         model = select_model(models)
 
-    return provider, base_url, api_key, model
+    temperature = _temperature(args.temperature or os.getenv("LLM_TEMPERATURE"))
+    max_chars = _int(args.max_chars or os.getenv("LLM_MAX_CHARS"), 6000)
+    max_tokens = _int(args.max_tokens or os.getenv("LLM_MAX_TOKENS"), 2000)
+    timeout = _int(args.timeout or os.getenv("LLM_TIMEOUT"), 60)
+
+    return provider, base_url, api_key, model, temperature, max_chars, max_tokens, timeout
 
 
 def _decode_error(e: urllib.error.HTTPError) -> str:
@@ -173,12 +189,13 @@ def _decode_error(e: urllib.error.HTTPError) -> str:
     return f"HTTP {e.code}: {e.reason}\n{body}".strip()
 
 
-def call_llm(transcript: str, model: str, api_key: str, base_url: str) -> list[dict[str, Any]]:
+def call_llm(transcript: str, model: str, api_key: str, base_url: str, temperature: int | float, max_tokens: int, timeout: int) -> list[dict[str, Any]]:
     chat_url = f"{base_url}/chat/completions"
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": PROMPT_TEMPLATE.format(transcript=transcript)}],
-        "temperature": 0.3,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
     }
 
     data = json.dumps(payload).encode("utf-8")
@@ -193,8 +210,9 @@ def call_llm(transcript: str, model: str, api_key: str, base_url: str) -> list[d
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw_body = resp.read().decode("utf-8", errors="replace").lstrip()
+            body, _ = json.JSONDecoder().raw_decode(raw_body)
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"LLM request failed: {_decode_error(e)}") from e
 
@@ -212,7 +230,26 @@ def call_llm(transcript: str, model: str, api_key: str, base_url: str) -> list[d
         content = content[:-3]
     content = content.strip()
 
-    labels = json.loads(content)
+    try:
+        labels = json.loads(content)
+    except json.JSONDecodeError as first_error:
+        decoder = json.JSONDecoder()
+        last_error = first_error
+        labels = None
+        for start, char in enumerate(content):
+            if char != "[":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(content[start:])
+            except json.JSONDecodeError as e:
+                last_error = e
+                continue
+            if isinstance(parsed, list):
+                labels = parsed
+                break
+        if labels is None:
+            preview = content[:1000].replace("\n", "\\n")
+            raise RuntimeError(f"Could not parse JSON array from LLM output: {last_error}. Preview: {preview}") from first_error
     if not isinstance(labels, list):
         raise RuntimeError("LLM did not return a JSON array")
     return labels
@@ -231,26 +268,45 @@ def load_transcript(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def focus_transcript(text: str) -> str:
+    for marker in ("**Detailed Transcript**", "Detailed Transcript", "详细访谈", "访谈原文"):
+        idx = text.lower().find(marker.lower())
+        if idx != -1:
+            return text[idx:]
+    return text
+
+
 def find_files(path: Path, recursive: bool = False) -> list[Path]:
     if recursive:
         files = [p for p in path.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
     else:
         files = [p for p in path.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
-    return sorted(files)
+    return sorted(p for p in files if not p.name.lower().startswith("manifest."))
 
 
-def process_file(path: Path, provider: str, model: str, api_key: str, base_url: str, overwrite: bool) -> int:
+def process_file(
+    path: Path,
+    provider: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    temperature: int | float,
+    max_chars: int,
+    max_tokens: int,
+    timeout: int,
+    overwrite: bool,
+) -> int:
     output = LABELED_DIR / f"{path.stem}.pseudo_labeled.jsonl"
     if output.exists() and not overwrite:
         print(f"  skip {path.name}: {output.name} already exists")
         return 0
 
-    transcript = load_transcript(path)
-    if len(transcript) > 12000:
-        print(f"  note {path.name}: long, sending first ~12000 characters")
-        transcript = transcript[:12000]
+    transcript = focus_transcript(load_transcript(path))
+    if len(transcript) > max_chars:
+        print(f"  note {path.name}: long, sending first ~{max_chars} characters")
+        transcript = transcript[:max_chars]
 
-    labels = call_llm(transcript, model, api_key, base_url)
+    labels = call_llm(transcript, model, api_key, base_url, temperature, max_tokens, timeout)
 
     LABELED_DIR.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as f:
@@ -273,6 +329,11 @@ def main() -> None:
     parser.add_argument("--base-url", help="API base URL (or env LLM_BASE_URL)")
     parser.add_argument("--api-key", help="API key (or env LLM_API_KEY)")
     parser.add_argument("--model", help="Model name (or env LLM_MODEL)")
+    parser.add_argument("--temperature", help="Sampling temperature (or env LLM_TEMPERATURE). Default: 1")
+    parser.add_argument("--max-chars", help="Input character cap per file (or env LLM_MAX_CHARS). Default: 6000")
+    parser.add_argument("--max-tokens", help="Output token cap (or env LLM_MAX_TOKENS). Default: 2000")
+    parser.add_argument("--timeout", help="HTTP timeout seconds (or env LLM_TIMEOUT). Default: 60")
+    parser.add_argument("--limit", type=int, help="Only process first N files in a directory")
     args = parser.parse_args()
 
     target = Path(args.path).expanduser().resolve()
@@ -285,6 +346,8 @@ def main() -> None:
         if not files:
             print(f"No supported files ({', '.join(sorted(SUPPORTED_EXTS))}) found in {target}")
             sys.exit(0)
+        if args.limit:
+            files = files[: args.limit]
         print(f"\nFound {len(files)} files to label:\n" + "\n".join(f"  - {f.name}" for f in files))
     else:
         if target.suffix.lower() not in SUPPORTED_EXTS:
@@ -292,13 +355,13 @@ def main() -> None:
             sys.exit(1)
         files = [target]
 
-    provider, base_url, api_key, model = resolve_config(args)
+    provider, base_url, api_key, model, temperature, max_chars, max_tokens, timeout = resolve_config(args)
 
-    print(f"\nLabeling {len(files)} file(s) with {provider}/{model} ...")
+    print(f"\nLabeling {len(files)} file(s) with {provider}/{model} (temperature={temperature}, max_chars={max_chars}, max_tokens={max_tokens}, timeout={timeout}) ...")
     total = 0
     for path in files:
         try:
-            total += process_file(path, provider, model, api_key, base_url, args.overwrite)
+            total += process_file(path, provider, model, api_key, base_url, temperature, max_chars, max_tokens, timeout, args.overwrite)
         except Exception as e:
             print(f"  failed {path.name}: {e}", file=sys.stderr)
 
