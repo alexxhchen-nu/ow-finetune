@@ -186,6 +186,10 @@ def parse_json_array(content: str) -> list[dict[str, Any]]:
         content = content[:-3]
     content = content.strip()
 
+    # Fix common LLM output issues
+    content = content.replace("\\'", "'")  # Python-style escaping
+    content = content.replace('\\"', '"')  # double-escaped quotes
+
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as first_error:
